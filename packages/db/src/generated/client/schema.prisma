@@ -1,0 +1,103 @@
+// Olive — database schema
+// Three concerns: conversations + messages (the chat) and inference_logs (the
+// observability record). inference_logs is intentionally decoupled from messages
+// via nullable FKs so telemetry survives even when chat persistence fails.
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../src/generated/client"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MessageRole {
+  user
+  assistant
+  system
+}
+
+enum ConversationStatus {
+  active
+  cancelled
+  archived
+}
+
+enum InferenceStatus {
+  success
+  error
+  cancelled
+}
+
+/// A multi-turn chat session. Drives list / resume / cancel in the UI.
+model Conversation {
+  id        String             @id @default(uuid()) @db.Uuid
+  title     String
+  provider  String
+  model     String
+  status    ConversationStatus @default(active)
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  messages      Message[]
+  inferenceLogs InferenceLog[]
+
+  // Conversation list is sorted by recency and filtered by status.
+  @@index([status, updatedAt])
+  @@map("conversations")
+}
+
+/// A single turn in a conversation. `sequence` gives a stable, gap-free order.
+model Message {
+  id             String      @id @default(uuid()) @db.Uuid
+  conversationId String      @db.Uuid
+  role           MessageRole
+  content        String
+  tokenCount     Int?
+  sequence       Int
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  inferenceLog InferenceLog?
+
+  @@unique([conversationId, sequence])
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+/// One record per LLM inference call. The analytics + observability table.
+/// Written asynchronously by the ingestion worker; `requestId` is unique so the
+/// worker can upsert idempotently when a job is retried.
+model InferenceLog {
+  id               String          @id @default(uuid()) @db.Uuid
+  requestId        String          @unique @db.Uuid
+  conversationId   String?         @db.Uuid
+  messageId        String?         @unique @db.Uuid
+  provider         String
+  model            String
+  status           InferenceStatus
+  latencyMs        Int
+  promptTokens     Int?
+  completionTokens Int?
+  totalTokens      Int?
+  errorType        String?
+  errorMessage     String?
+  inputPreview     String? // truncated + PII-redacted
+  outputPreview    String? // truncated + PII-redacted
+  startedAt        DateTime
+  completedAt      DateTime
+  metadata         Json? // flexible bag for evolving fields (redaction counts, etc.)
+  createdAt        DateTime        @default(now())
+
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  message      Message?      @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  // Dashboard aggregations filter/group by provider, model, status and time.
+  @@index([provider, model])
+  @@index([status])
+  @@index([createdAt])
+  @@map("inference_logs")
+}
